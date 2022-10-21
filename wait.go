@@ -4,9 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/rockset/rockset-go-client/openapi"
 	"github.com/rockset/rockset-go-client/option"
 	"github.com/rs/zerolog"
 )
+
+//go:generate go run github.com/maxbrunsfeld/counterfeiter/v6 -generate
 
 const (
 	collectionStatusREADY = "READY"
@@ -47,18 +50,17 @@ func (rc *RockClient) WaitUntilKafkaIntegrationActive(ctx context.Context, integ
 // WaitUntilAliasAvailable waits until the alias is available.
 func (rc *RockClient) WaitUntilAliasAvailable(ctx context.Context, workspace, alias string) error {
 	return rc.RetryWithCheck(ctx, func() (bool, error) {
-		_, _, err := rc.AliasesApi.GetAlias(ctx, workspace, alias).Execute()
+		_, err := rc.GetAlias(ctx, workspace, alias)
 
 		if err == nil {
 			return false, nil
 		}
 
-		re := NewError(err)
-		if re.IsNotFoundError() {
-			return true, nil
-		}
-		if re.Retryable() {
-			return true, nil
+		var re Error
+		if errors.As(err, &re) {
+			if re.IsNotFoundError() {
+				return true, nil
+			}
 		}
 
 		return false, err
@@ -68,12 +70,12 @@ func (rc *RockClient) WaitUntilAliasAvailable(ctx context.Context, workspace, al
 // WaitUntilQueryCompleted waits until queryID has either completed, errored, or been cancelled.
 func (rc *RockClient) WaitUntilQueryCompleted(ctx context.Context, queryID string) error {
 	// TODO should this only wait for COMPLETED and return an error for ERROR and CANCELLED?
-	return rc.RetryWithCheck(ctx, rc.queryHasStatus(ctx, queryID, []QueryState{QueryCompleted, QueryError, QueryCancelled}))
+	return rc.RetryWithCheck(ctx, queryHasStatus(ctx, rc, queryID, []QueryState{QueryCompleted, QueryError, QueryCancelled}))
 }
 
 // WaitUntilCollectionReady waits until the collection is ready.
 func (rc *RockClient) WaitUntilCollectionReady(ctx context.Context, workspace, name string) error {
-	return rc.RetryWithCheck(ctx, rc.collectionHasState(ctx, workspace, name, collectionStatusREADY))
+	return rc.RetryWithCheck(ctx, collectionHasState(ctx, rc, workspace, name, collectionStatusREADY))
 }
 
 // WaitUntilCollectionGone waits until a collection marked for deletion is gone, i.e. GetCollection()
@@ -91,14 +93,13 @@ func (rc *RockClient) WaitUntilViewGone(ctx context.Context, workspace, name str
 // WaitUntilCollectionHasNewDocuments waits until the collection has at least count new documents
 // (measured from when the method is called).
 func (rc *RockClient) WaitUntilCollectionHasNewDocuments(ctx context.Context, workspace, name string, count int64) error {
-	waiter := docWaiter{rc: rc}
+	waiter := docWaiter{getter: rc}
 	return rc.RetryWithCheck(ctx, waiter.collectionHasNewDocs(ctx, workspace, name, count))
 }
 
 // WaitUntilCollectionHasDocuments waits until the collection has at least count documents
 func (rc *RockClient) WaitUntilCollectionHasDocuments(ctx context.Context, workspace, name string, count int64) error {
-	waiter := docWaiter{rc: rc}
-	return rc.RetryWithCheck(ctx, waiter.collectionHasNewDocs(ctx, workspace, name, count))
+	return rc.RetryWithCheck(ctx, collectionHasDocs(ctx, rc, workspace, name, count))
 }
 
 // WaitUntilWorkspaceAvailable waits until the workspace is available.
@@ -108,9 +109,14 @@ func (rc *RockClient) WaitUntilWorkspaceAvailable(ctx context.Context, workspace
 
 // TODO(pme) refactor viewIsGone() and collectionIsGone() to be DRY
 
-func (rc *RockClient) queryHasStatus(ctx context.Context, queryID string, statuses []QueryState) RetryCheck {
+//counterfeiter:generate -o fakes . queryInfoGetter
+type queryInfoGetter interface {
+	GetQueryInfo(context.Context, string) (openapi.QueryInfo, error)
+}
+
+func queryHasStatus(ctx context.Context, getter queryInfoGetter, queryID string, statuses []QueryState) RetryCheck {
 	return func() (bool, error) {
-		res, err := rc.GetQueryInfo(ctx, queryID)
+		res, err := getter.GetQueryInfo(ctx, queryID)
 		if err != nil {
 			return false, err
 		}
@@ -140,9 +146,6 @@ func (rc *RockClient) workspaceIsAvailable(ctx context.Context, workspace string
 				// the view is no longer present
 				return true, nil
 			}
-			if re.Retryable() {
-				return true, nil
-			}
 		}
 
 		return false, err
@@ -166,9 +169,6 @@ func (rc *RockClient) viewIsGone(ctx context.Context, workspace, name string) Re
 				// the view is no longer present
 				return false, nil
 			}
-			if re.Retryable() {
-				return true, nil
-			}
 		}
 
 		return false, err
@@ -191,25 +191,22 @@ func (rc *RockClient) collectionIsGone(ctx context.Context, workspace, name stri
 				// the collection is gone
 				return false, nil
 			}
-			if re.Retryable() {
-				return true, nil
-			}
 		}
 
 		return false, err
 	}
 }
 
-func (rc *RockClient) collectionHasState(ctx context.Context, workspace, name, state string) RetryCheck {
+//counterfeiter:generate -o fakes . collectionGetter
+type collectionGetter interface {
+	GetCollection(context.Context, string, string) (openapi.Collection, error)
+}
+
+func collectionHasState(ctx context.Context, getter collectionGetter, workspace, name, state string) RetryCheck {
 	return func() (bool, error) {
 		zl := zerolog.Ctx(ctx)
-		c, err := rc.GetCollection(ctx, workspace, name)
+		c, err := getter.GetCollection(ctx, workspace, name)
 		if err != nil {
-			re := NewError(err)
-			if re.Retryable() {
-				return true, nil
-			}
-
 			return false, err
 		}
 
@@ -224,7 +221,7 @@ func (rc *RockClient) collectionHasState(ctx context.Context, workspace, name, s
 }
 
 type docWaiter struct {
-	rc        *RockClient
+	getter    collectionGetter
 	prevCount int64
 }
 
@@ -232,13 +229,8 @@ func (d *docWaiter) collectionHasNewDocs(ctx context.Context, workspace, name st
 	d.prevCount = -1
 	return func() (bool, error) {
 		zl := zerolog.Ctx(ctx)
-		c, err := d.rc.GetCollection(ctx, workspace, name)
+		c, err := d.getter.GetCollection(ctx, workspace, name)
 		if err != nil {
-			re := NewError(err)
-			if re.Retryable() {
-				return true, nil
-			}
-
 			return false, err
 		}
 
@@ -259,23 +251,17 @@ func (d *docWaiter) collectionHasNewDocs(ctx context.Context, workspace, name st
 	}
 }
 
-func (d *docWaiter) collectionHasDocs(ctx context.Context, workspace, name string, count int64) RetryCheck {
+func collectionHasDocs(ctx context.Context, getter collectionGetter, workspace, name string, count int64) RetryCheck {
 	return func() (bool, error) {
 		zl := zerolog.Ctx(ctx)
-		c, err := d.rc.GetCollection(ctx, workspace, name)
+		c, err := getter.GetCollection(ctx, workspace, name)
 		if err != nil {
-			re := NewError(err)
-			if re.Retryable() {
-				return true, nil
-			}
-
 			return false, err
 		}
 
 		current := c.Stats.GetDocCount()
-		zl.Debug().Str("workspace", workspace).Int64("current", current).
-			Int64("previous", d.prevCount).Str("collection", name).
-			Int64("count", count).Msg("collectionHasNewDocs()")
+		zl.Debug().Str("workspace", workspace).Int64("current", current).Str("collection", name).
+			Int64("count", count).Msg("collectionHasDocs()")
 
 		if current >= count {
 			return false, nil
