@@ -16,7 +16,7 @@ type IntegrationTestSuite struct {
 }
 
 func TestIntegrationTestSuite(t *testing.T) {
-	rc, randomName := vcrClient(t)
+	rc, randomName := vcrClient(t, t.Name())
 
 	suite.Run(t, &IntegrationTestSuite{
 		rc:             rc,
